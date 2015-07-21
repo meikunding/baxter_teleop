@@ -1,0 +1,279 @@
+#!/usr/bin/env python
+
+import code
+from collections import deque
+import time
+import rospy
+import tf2_ros
+import baxter_interface
+from baxter_interface import CHECK_VERSION
+import rospy
+import baxter_interface
+import os
+import sys
+import argparse
+import cv2
+import cv_bridge
+import threading
+import stopthread
+from sensor_msgs.msg import Image
+from teleoperate_tweaked import get_joint_angles
+
+BANNER = "WELCOME TO BAXTER"
+DEFAULT_RATE = 10
+DEFAULT_IMAGE = 'images/eyes.png'
+
+class BaxterInterface(object):
+
+    def __init__(self):
+        ''' Initializes the interface to Baxter. '''
+        # initialize console variables
+        self.image_timer = None
+        self.image_queue = deque()
+        self.image_queue_lock = threading.Lock()
+        self.motion_queue = deque()
+        self.motion_queue_lock = threading.Lock()
+        self.motion_timer = None
+        self.mirrored = False
+        self.user = 1
+        self.state_queue = deque()
+        self.state_queue_lock = threading.Lock()
+        self.current_state = None
+        self.exit = False
+        self.angles = None
+
+        # initialize the robot
+        print("Initializing node... ")
+        rospy.init_node("teleoperation")
+        print("Getting robot state... ")
+        rs = baxter_interface.RobotEnable(CHECK_VERSION)
+        init_state = rs.state().enabled
+        
+        def clean_shutdown():
+            print("\nExiting...")
+            if not init_state:
+                print("Disabling robot...")
+                rs.disable()
+        rospy.on_shutdown(clean_shutdown)
+
+        print("Enabling robot... ")
+        rs.enable()
+
+        # create interfaces to limbs and kinect tracking
+        self.left_limb = baxter_interface.Limb('left')
+        self.right_limb = baxter_interface.Limb('right')
+        self.head = baxter_interface.Head()
+        self.tfBuffer = tf2_ros.Buffer()
+        self.listener = tf2_ros.TransformListener(self.tfBuffer)
+        self.rate = rospy.Rate(DEFAULT_RATE)
+
+        #starting position
+        self.thread = stopthread.StopThread(lambda : self.control_loop())
+        self.idle()
+        self.thread.start()
+        self.idle()
+
+    def control_loop(self):
+        while not rospy.is_shutdown():
+            if self.exit:
+                rospy.Shutdown()
+
+            # STATE
+            self.state_queue_lock.acquire()
+            self.motion_queue_lock.acquire()
+            self.image_queue_lock.acquire()
+            empty_queues = len(self.motion_queue) == 0 and len(self.image_queue) == 0
+            self.motion_queue_lock.release()
+            self.image_queue_lock.release()
+            # motion and image queues are released in case we need to add to them
+            if empty_queues and len(self.state_queue) > 0:
+                # pop state queue if image and state queues are empty/finished
+                self.current_state = self.state_queue.popleft()
+                # look for image data
+                if 'image_mode' in self.current_state:
+                    # load a csv file for images
+                    if self.current_state['image_mode'] == 'csv_file':
+                        self.load_image_file(self.current_state['image_filepath'])
+                    # list of images with duration
+                    elif self.current_state['image_mode'] == 'list':
+                        for image in self.current_state['image_list']:
+                            self.queue_image(image['filepath'], image['duration'])
+                else:
+                    self.current_state['image_mode'] = "idle"
+                # look for position data                             
+                if 'position_mode' in self.current_state:
+                    # load a csv file for positions
+                    if self.current_state['position_mode'] == 'csv_file':
+                        self.load_position_file(self.current_state['position_file'])
+                    # list of positions with duration
+                    elif self.current_state['position_mode'] == 'list':
+                        for motion in self.current_state['position_list']:
+                            self.queue_motion(motion["duration"], motion["angles"])
+                else:
+                    self.current_state['position_mode'] = "idle"
+            self.state_queue_lock.release()       
+
+            # JOINT POSITIONS
+            if self.current_state['position_mode'] != "idle":
+                if self.current_state['position_mode'] == "stopping":
+                    self.motion_queue.clear()
+                    self.load_position_file("csv/idle.csv")
+                    self.set_joint_angles(self.motion_queue[0]['positions'])
+                    self.motion_queue.popleft()
+                    self.current_state['position_mode'] = "idle"
+                elif self.current_state['position_mode'] == "teleoperation":
+                    # if the robot is being teleoperated, get kinect joint angles
+                    self.motion_timer = None
+                    joint_angles = get_joint_angles(self.user, self.tfBuffer, False, self.mirrored)
+                    if joint_angles is not None:
+                        # concatenate joint angle dicts
+                        joint_angles['left'].update(joint_angles['right'])
+                        self.set_joint_angles(joint_angles['left'])
+                    else:
+                        self.idle()
+                else:
+                    # if the robot is not idle or teleoperated, check motion queue
+                    self.motion_queue_lock.acquire()
+                    if self.motion_timer is not None:
+                        self.motion_timer = self.motion_timer + DEFAULT_RATE
+                    if len(self.motion_queue) > 0:
+                        #ready to publish new motion
+                        if self.motion_timer is None:
+                            self.set_joint_angles(self.motion_queue[0]['positions'])
+                            self.motion_timer = 0
+                        #motion expired (publish new motion next turn if queue not empty)
+                        elif self.motion_timer >= self.motion_queue[0]['duration'] - DEFAULT_RATE:
+                            if self.motion_queue[0] != 0 and len(self.motion_queue) == 0:
+                                # if duration is 0, hold position indefinitely
+                                self.current_state["position_mode"] = "stopping"
+                            self.motion_queue.popleft()
+                            self.motion_timer = None
+                    self.motion_queue_lock.release()
+            self.move_to_joint_angles()
+            
+            #IMAGES
+            if self.current_state["image_mode"] is not "idle":
+                if self.current_state["image_mode"] is "stopping":
+                    self.send_image(DEFAULT_IMAGE)
+                    self.image_queue.clear()
+                    self.current_state["image_mode"] = "idle"
+                else:
+                    # update image timer/queue
+                    self.image_queue_lock.acquire()
+                    if self.image_timer is not None:
+                        self.image_timer = self.image_timer + DEFAULT_RATE
+                    if len(self.image_queue) > 0:
+                        #ready to publish new image
+                        if self.image_timer is None:
+                            self.send_image(self.image_queue[0]['filepath'])
+                            self.image_timer = 0
+                        #image expired (publish new image next turn if queue not empty)
+                        elif self.image_timer >= self.image_queue[0]['duration'] - DEFAULT_RATE:
+                            if self.image_queue[0]['duration'] != 0 and len(self.image_queue) == 0:
+                                # if duration is 0, display image indefinitely
+                                self.current_state["image_mode"] = "stopping"
+                            self.image_queue.popleft()
+                            self.image_timer = None
+                    self.image_queue_lock.release()
+            self.rate.sleep()
+
+        self.thread.stop()
+        print "Rospy shutdown, exiting command loop."
+
+    # User Functions
+    def idle(self): 
+        self.queue_state({"position_mode":"stopping", "image_mode": "stopping"})
+    
+    def standby(self): 
+        self.queue_state({"image_mode":"list", "image_list":[{"duration":0, "filepath":"images/waiting.png"}],"position_mode":"csv_file","position_file":"csv/standby.csv"})
+
+    def start_teleoperation(self, transition=1):
+        if transition == 1:
+            self.queue_state({"position_mode":"teleoperation","image_mode":"list", "image_list":[{"duration":0, "filepath":"images/on.png"}]})
+        else:
+            if transition == 2:
+                self.queue_state({"position_mode":"csv_file", "position_file": "csv/raise_hand.csv","image_mode":"csv_file", "image_filepath":"csv/transition2.csv"})
+                self.queue_state({"position_mode":"teleoperation"})
+            elif transition == 3:
+                self.queue_state({"image_mode":"csv_file","image_filepath":"csv/transition3.csv"})
+                self.queue_state({"position_mode":"teleoperation"})
+
+    def test_motion(self):
+        self.queue_state({"position_mode":"csv_file", "position_file": "csv/test.csv"})
+
+
+    def queue_state(self, dict):
+        self.state_queue_lock.acquire()
+        self.state_queue.append(dict)
+        self.state_queue_lock.release()
+         
+
+    # Internal Functions
+    def move_to_joint_angles(self):
+        self.right_limb.set_joint_positions(self.angles)
+        self.left_limb.set_joint_positions(self.angles)
+        if 'head_pan' in self.angles:
+            self.head.set_pan(self.angles['head_pan'])
+        if 'head_nod' in self.angles and self.angles['head_nod'] > 0.1:
+            self.head.command_nod()
+
+    def set_joint_angles(self, angles):
+        self.angles = angles
+
+    def queue_motion(self, duration, motion_dict):
+        self.motion_queue_lock.acquire()
+        self.motion_queue.append({"duration" : int(duration), "positions" : motion_dict}) 
+        self.motion_queue_lock.release()      
+    
+    def queue_image(self, new_image, duration):
+        ''' Adds the image to a queue of images to be shown for a specified amount of time '''
+        self.image_queue_lock.acquire()
+        self.image_queue.append({'duration': int(duration), 'filepath': new_image })
+        self.image_queue_lock.release()
+
+    def send_image(self, path):
+        """
+        Send the image located at the specified path to the head
+        display on Baxter.
+        @param path: path to the image file to load and send
+        """
+        img = cv2.imread(path)
+        msg = cv_bridge.CvBridge().cv2_to_imgmsg(img, encoding="bgr8")
+        pub = rospy.Publisher('/robot/xdisplay', Image, latch=True, queue_size=1)
+        pub.publish(msg)
+        # Sleep to allow for image to be published.
+        # removed by alice
+        #rospy.sleep(1)
+
+
+    def interact(self):
+        baxter = self
+        code.interact(banner=BANNER, local=locals())
+        
+    def load_image_file(self, filename):
+        with open(filename) as f:
+            filelines = f.readlines()
+            keys = filelines[0].rstrip('\n').split(',')
+            for image_line in filelines[1:]:
+                image_line = image_line.rstrip('\n')
+                this_image_dict = {}
+                image_pieces = image_line.split(',')
+                for i in range(0,len(keys)):
+                    this_image_dict[keys[i]] = image_pieces[i]
+                self.queue_image(this_image_dict['filepath'], this_image_dict['duration'])
+                
+    def load_position_file(self, filename):
+        with open(filename) as f:
+            filelines = f.readlines()
+            keys = filelines[0].rstrip('\n').split(',')
+            for position_line in filelines[1:]:
+                position_line = position_line.rstrip()
+                this_position_dict = {}
+                position_pieces = position_line.split(',')
+                for i in range(1,len(keys)):
+                    this_position_dict[keys[i]] = float(position_pieces[i])
+                self.queue_motion(position_pieces[0], this_position_dict)
+    
+if __name__ == '__main__':
+    baxter = BaxterInterface()
+    baxter.interact()

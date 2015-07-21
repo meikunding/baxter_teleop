@@ -1,0 +1,24 @@
+<launch>
+  <include file="$(find openni_launch)/launch/openni.launch">   
+  </include>
+
+  <node pkg="openni_tracker" name="openni_tracker" type="openni_tracker" output="screen">
+    <param name="camera_frame_id" value="camera_depth_frame" />
+  </node>
+ <!-- 
+ <node pkg="baxter_teleop" name="teleop" type="teleoperate_tweaked.py" output="screen">  
+    <param name="rate" value="5" />
+    <param name="test" value="False" />
+    <param name="user" value="1" />
+    <param name="mirrored" value="False"/>
+  </node> -->
+    <node pkg="baxter_teleop" name="teleopc" type="teleoperate-c.py" output="screen">  
+    <param name="rate" value="5" />
+    <param name="test" value="False" />
+    <param name="user" value="1" />
+    <param name="mirrored" value="False"/>
+  </node>
+      
+  <node name="rviz" pkg="rviz" type="rviz" args="-d $(find baxter_teleop)/launch/kinect.rviz"/>
+
+</launch>
